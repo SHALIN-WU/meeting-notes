@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#13283F">
+  <meta name="color-scheme" content="light">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="description" content="錄音、轉寫並整理成繁體中文會議記錄。">
+  <title>會議記錄</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="css/app.css">
+  <script>
+    (function () {
+      var local = location.hostname === '127.0.0.1';
+      var token = '';
+      var exp = 0;
+      try {
+        token = sessionStorage.getItem('meeting-ai-token') || '';
+        exp = Number(sessionStorage.getItem('meeting-ai-exp') || 0);
+      } catch (error) { /* 私密模式可能擋住 sessionStorage */ }
+      document.documentElement.dataset.boot = (!local && (!token || !(exp > Date.now()))) ? 'gate' : 'app';
+    })();
+  </script>
+</head>
+<body>
+  <div id="gate" class="gate">
+    <form id="loginForm" class="gate-card">
+      <img class="brand-logo" src="images/northgo-logo.png?v=1" alt="NorthGo">
+      <h2>會議記錄</h2>
+      <p id="gateLead">請輸入密碼以繼續。</p>
+      <label class="field" for="password">
+        <span>密碼</span>
+        <input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required>
+      </label>
+      <button id="loginSubmit" type="submit">登入</button>
+      <p id="loginError" class="alert" hidden></p>
+      <button id="skipBtn" type="button" hidden>返回（不登入）</button>
+      <p id="skipHint" class="fine" hidden>只有 127.0.0.1 本機預覽可以返回。正式網站必須登入。</p>
+    </form>
+  </div>
+
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <img class="brand-logo" src="images/northgo-logo.png?v=1" alt="NorthGo">
+        <div>
+          <p class="eyebrow">錄音・轉寫・整理</p>
+          <h1>會議記錄</h1>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="loginBtn" type="button" hidden>登入</button>
+        <button id="lockBtn" type="button" hidden>鎖定</button>
+      </div>
+    </header>
+    <p id="localBanner" class="banner" hidden></p>
+    <main>
+      <section id="viewHome">
+        <div class="hero">
+          <div class="hero-copy">
+            <h2>會議記錄</h2>
+            <p>按下開始，AI 自動記錄與整理</p>
+          </div>
+        </div>
+        <p id="homeAlert" class="alert" hidden></p>
+        <div id="idlePanel" class="idle">
+          <button id="startBtn" class="record-btn" type="button" aria-label="開始錄音">
+            <span class="record-core" aria-hidden="true"></span>
+            <span>開始<br>錄音</span>
+          </button>
+          <p class="hint">使用麥克風錄音。約每 10 分鐘轉成逐字稿並標上時間，第一段會在約 10 分鐘後出現。錄音檔不會保存。</p>
+          <fieldset class="lang-box">
+            <legend>會議語言（可多選）</legend>
+            <div id="langChips" class="chips" role="group" aria-label="會議語言"></div>
+            <p class="fine">混合會議請把會用到的語言都選起來。選了台語時，會把台語轉寫成繁體中文意思。</p>
+          </fieldset>
+          <button id="historyBtn" class="wide-button" type="button">歷史記錄</button>
+        </div>
+        <div id="recPanel" class="rec-panel" hidden>
+          <div class="timer-row">
+            <span id="recDot" class="dot" aria-hidden="true"></span>
+            <div>
+              <p id="timer" class="timer" role="timer">00:00:00</p>
+              <p id="recState" class="rec-state">錄音中</p>
+            </div>
+          </div>
+          <p id="langSummary" class="fine"></p>
+          <p id="segmentState" class="segment">本段 00:00／10:00</p>
+          <p id="chunkStatus" class="status" role="status"></p>
+          <p id="wakeNote" class="warn" hidden>此瀏覽器無法防止螢幕休眠，請保持畫面開啟。</p>
+          <p id="levelNote" class="warn" hidden>收音音量偏低</p>
+          <div id="liveTranscript" class="transcript" tabindex="0" aria-label="逐字稿"></div>
+          <div class="rec-actions">
+            <button id="pauseBtn" type="button">暫停</button>
+            <button id="stopBtn" class="stop" type="button">結束</button>
+            <button id="discardBtn" type="button" hidden>捨棄</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="viewHistory" hidden>
+        <div class="view-head">
+          <button id="historyBack" type="button">返回</button>
+          <h2>歷史記錄</h2>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </section>
+
+      <section id="viewNotes" hidden>
+        <div class="view-head">
+          <button id="notesBack" type="button" data-action="back">返回</button>
+          <h2>會議記錄</h2>
+          <p id="saveState" class="fine"></p>
+        </div>
+        <p id="noteAlert" class="alert" hidden></p>
+        <div id="noteForm"></div>
+        <div class="toolbar">
+          <button id="btnDownload" class="primary wide" type="button" data-action="download">下載 Word</button>
+          <button id="btnCopy" type="button" data-action="copy">複製文字</button>
+          <button id="btnSave" type="button" data-action="save">儲存</button>
+          <button id="btnRegen" type="button" data-action="regen">重新整理</button>
+          <button id="btnDelete" class="danger-text wide" type="button" data-action="delete">刪除</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalText">
+      <p id="modalText"></p>
+      <div class="modal-actions">
+        <button id="modalCancel" type="button">取消</button>
+        <button id="modalOk" type="button">確定</button>
+      </div>
+    </div>
+  </div>
+  <div id="toast" class="toast" hidden role="status"></div>
+  <div id="srStatus" class="sr-only" role="status"></div>
+  <noscript><p class="banner">請開啟 JavaScript 才能使用會議記錄。</p></noscript>
+  <script src="libs/jszip.min.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

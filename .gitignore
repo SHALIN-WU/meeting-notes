@@ -1,0 +1,13 @@
+.env
+.dev.vars
+.wrangler/
+worker/.wrangler/
+node_modules/
+worker/node_modules/
+backup/
+*.docx
+*.webm
+*.mp4
+*.m4a
+*.mp3
+*.wav

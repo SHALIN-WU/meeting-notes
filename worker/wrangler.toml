@@ -1,0 +1,18 @@
+name = "meeting-ai"
+main = "src/index.js"
+compatibility_date = "2025-11-01"
+
+# Do not put passwords or API keys in this file.
+# Production:
+#   npx wrangler secret put MEETING_PASS
+#   npx wrangler secret put TOKEN_SECRET
+#   npx wrangler secret put GEMINI_API_KEY
+# Local wrangler dev reads worker/.dev.vars, which is gitignored.
+#
+# Login lockout uses KV when this binding exists, and isolate memory otherwise.
+# Create a namespace before deploying, then replace the id below:
+#   npx wrangler kv namespace create RATE_LIMIT
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "55cd214750d14b5e82bd49eed4d7325e"
+preview_id = "55cd214750d14b5e82bd49eed4d7325e"
