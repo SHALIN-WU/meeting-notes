@@ -116,10 +116,17 @@
         <p id="noteAlert" class="alert" hidden></p>
         <div id="noteForm"></div>
         <div class="toolbar">
-          <button id="btnDownload" class="primary wide" type="button" data-action="download">下載 Word</button>
+          <div class="download-row wide">
+            <button id="btnDownload" class="primary" type="button" data-action="download">下載 Word</button>
+            <label class="check-inline" for="includeTranscript">
+              <input id="includeTranscript" type="checkbox" checked>
+              附上逐字稿
+            </label>
+          </div>
           <button id="btnCopy" type="button" data-action="copy">複製文字</button>
           <button id="btnSave" type="button" data-action="save">儲存</button>
           <button id="btnRegen" type="button" data-action="regen">重新整理</button>
+          <button id="btnRebuild" type="button" data-action="rebuild">重新產生會議記錄</button>
           <button id="btnDelete" class="danger-text wide" type="button" data-action="delete">刪除</button>
         </div>
       </section>

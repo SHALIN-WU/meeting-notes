@@ -1,6 +1,7 @@
 const GEMINI_MODEL = 'gemini-3.8-flash';
-const GEMINI_FALLBACK_MODEL = '';
+const GEMINI_FALLBACK_MODEL = 'gemini-flash-lite-latest';
 const GEMINI_TIMEOUT_MS = 90000;
+const GEMINI_SUMMARY_TIMEOUT_MS = 180000;
 const GEMINI_RETRY_DELAYS_MS = [2000, 4000];
 
 const LANG_HINT = {
@@ -90,11 +91,11 @@ export async function transcribeAudio(env, { audio, mimeType, languages }) {
   return extractText(result);
 }
 
-export async function summarizeTranscript(env, { transcript, languages, startedAt, durationText }) {
+export function summarizeTranscript(env, { transcript, languages, startedAt, durationText }) {
   const clipped = clipText(transcript, 100000);
   if (!clipped) throw new GeminiError('沒有逐字稿可以整理。', 400);
   const languageText = normalizeLanguages(languages).map((id) => LANG_HINT[id]).join('\n');
-  const result = await generate(env, ({ thinking, schema }) => ({
+  return summaryEventStream(env, ({ thinking, schema }) => ({
     systemInstruction: {
       parts: [{ text: [
         '你是會議記錄整理員。請依逐字稿輸出 JSON。',
@@ -123,8 +124,7 @@ export async function summarizeTranscript(env, { transcript, languages, startedA
       }]
     }],
     generationConfig: generationConfig({ thinking, temperature: 0.2, json: true, schema })
-  }));
-  return normalizeNotes(parseModelJson(extractText(result)));
+  }), GEMINI_SUMMARY_TIMEOUT_MS);
 }
 
 function generationConfig({ thinking, temperature, json, schema }) {
@@ -133,6 +133,53 @@ function generationConfig({ thinking, temperature, json, schema }) {
   if (json) config.responseMimeType = 'application/json';
   if (json && schema) config.responseSchema = summarySchema();
   return config;
+}
+
+/** flash-lite 不接受 thinkingBudget: 0；整理時另要求純 JSON、不要 markdown 區塊。 */
+function adaptBodyForFallbackModel(body) {
+  try {
+    const adapted = JSON.parse(JSON.stringify(body || {}));
+    const config = adapted.generationConfig;
+    if (config && typeof config === 'object' && config.thinkingConfig) {
+      delete config.thinkingConfig;
+    }
+    if (config && (config.responseMimeType === 'application/json' || config.responseSchema)) {
+      appendFallbackJsonInstruction(adapted);
+    }
+    return adapted;
+  } catch {
+    return body;
+  }
+}
+
+function appendFallbackJsonInstruction(body) {
+  const lines = [
+    '只輸出一個 JSON 物件，不要用 markdown 程式碼區塊（不要出現 ```），不要輸出其他說明文字。',
+    '欄位與主模型相同，必須包含：title、datetime、attendees、summary、discussions、decisions、actions。',
+    'attendees、discussions、decisions 為字串陣列；actions 為物件陣列，每項含 task、owner、due 字串。'
+  ];
+  const extra = lines.join('\n');
+  const sys = body?.systemInstruction?.parts;
+  if (Array.isArray(sys) && sys[0] && typeof sys[0].text === 'string') {
+    sys[0].text = `${sys[0].text}\n${extra}`;
+    return;
+  }
+  const userParts = body?.contents?.[0]?.parts;
+  if (Array.isArray(userParts) && userParts[0] && typeof userParts[0].text === 'string') {
+    userParts[0].text = `${extra}\n${userParts[0].text}`;
+  }
+}
+
+function logGeminiHttpError(status, endpointName, model, data, raw, apiKey, message) {
+  if (status === 400) {
+    const detailSource = data?.error != null ? data.error : (data && Object.keys(data).length ? data : raw);
+    const detail = typeof detailSource === 'string'
+      ? redactSecrets(detailSource, apiKey)
+      : redactSecrets(JSON.stringify(detailSource || {}), apiKey);
+    console.error('gemini', status, endpointName, model, detail);
+    return;
+  }
+  console.error('gemini', status, endpointName, model, message);
 }
 
 function summarySchema() {
@@ -162,32 +209,37 @@ function summarySchema() {
   };
 }
 
-async function generate(env, factory) {
-  let result = await postGemini(env, factory({ thinking: !omitThinking, schema: !omitSchema }));
+async function generate(env, factory, timeoutMs = GEMINI_TIMEOUT_MS) {
+  let result = await postGemini(env, factory({ thinking: !omitThinking, schema: !omitSchema }), timeoutMs);
   if (!result.ok && result.status === 400 && !omitThinking && /thinking/i.test(result.message)) {
     omitThinking = true;
-    result = await postGemini(env, factory({ thinking: false, schema: !omitSchema }));
+    result = await postGemini(env, factory({ thinking: false, schema: !omitSchema }), timeoutMs);
   }
   if (!result.ok && result.status === 400 && !omitSchema && /schema|mime/i.test(result.message)) {
     omitSchema = true;
-    result = await postGemini(env, factory({ thinking: !omitThinking, schema: false }));
+    result = await postGemini(env, factory({ thinking: !omitThinking, schema: false }), timeoutMs);
   }
   if (!result.ok) throw new GeminiError(publicGeminiError(result.status, result.message), clientStatus(result.status));
   return result.data;
 }
 
-async function postGemini(env, body) {
+async function postGemini(env, body, timeoutMs = GEMINI_TIMEOUT_MS) {
   if (typeof env?.GEMINI_API_KEY !== 'string' || !env.GEMINI_API_KEY) {
     throw new GeminiError('語音服務尚未設定，請檢查 Worker 的 GEMINI_API_KEY。', 500);
   }
-  let result = await requestModel(env, body, GEMINI_MODEL);
+  let result = await requestModel(env, body, GEMINI_MODEL, timeoutMs);
   for (let i = 0; i < GEMINI_RETRY_DELAYS_MS.length && !result.ok && isRetryableStatus(result.status) && !result.timedOut; i += 1) {
     await sleep(GEMINI_RETRY_DELAYS_MS[i]);
-    result = await requestModel(env, body, GEMINI_MODEL);
+    result = await requestModel(env, body, GEMINI_MODEL, timeoutMs);
   }
   const fallback = GEMINI_FALLBACK_MODEL.trim();
-  if (fallback && !result.ok && !result.timedOut && isRetryableStatus(result.status)) {
-    result = await requestModel(env, body, fallback);
+  if (fallback && shouldTryFallbackModel(result)) {
+    const primary = result;
+    result = await requestModel(env, adaptBodyForFallbackModel(body), fallback, timeoutMs);
+    if (!result.ok && isFallbackModelMissing(result)) {
+      console.error('fallback model not found', fallback);
+      return primary;
+    }
   }
   return result;
 }
@@ -246,10 +298,12 @@ async function fetchGeminiJson(env, url) {
   }
 }
 
-async function requestModel(env, body, model) {
+async function requestModel(env, body, model, timeoutMs = GEMINI_TIMEOUT_MS) {
+  const endpointName = 'generateContent';
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    console.log('gemini', 'call', endpointName, model);
     const response = await fetch(geminiEndpoint(model), {
       method: 'POST',
       headers: {
@@ -268,14 +322,15 @@ async function requestModel(env, body, model) {
     }
     if (!response.ok) {
       const message = redactSecrets(String(data?.error?.message || raw || ''), env.GEMINI_API_KEY).slice(0, 500);
-      console.error('gemini', response.status, model, message);
-      return { ok: false, status: response.status, message, data, timedOut: false };
+      logGeminiHttpError(response.status, endpointName, model, data, raw, env.GEMINI_API_KEY, message);
+      return { ok: false, status: response.status, message, data, timedOut: false, model };
     }
-    return { ok: true, status: response.status, message: '', data, timedOut: false };
+    console.log('gemini', 'using', endpointName, model);
+    return { ok: true, status: response.status, message: '', data, timedOut: false, model };
   } catch (err) {
     const timedOut = controller.signal.aborted || err?.name === 'AbortError' || err?.name === 'TimeoutError';
-    console.error('gemini', timedOut ? 'timeout' : 'network', model);
-    return { ok: false, status: 503, message: timedOut ? 'timeout' : 'network', data: {}, timedOut };
+    console.error('gemini', timedOut ? 'timeout' : 'network', endpointName, model);
+    return { ok: false, status: 503, message: timedOut ? 'timeout' : 'network', data: {}, timedOut, model };
   } finally {
     clearTimeout(timer);
   }
@@ -285,12 +340,356 @@ function geminiEndpoint(model) {
   return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 }
 
-function isRetryableStatus(status) {
-  return status === 503;
+function geminiStreamEndpoint(model) {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+const SUMMARY_HEARTBEAT_MS = 15000;
+
+function summaryEventStream(env, factory, timeoutMs) {
+  const encoder = new TextEncoder();
+  const stop = new AbortController();
+  return new ReadableStream({
+    async start(controller) {
+      let closed = false;
+      const ping = () => {
+        if (closed) return;
+        try { controller.enqueue(encoder.encode(': ping\n\n')); }
+        catch { closed = true; }
+      };
+      ping();
+      try {
+        const result = await withPings(
+          openSummaryStream(env, factory, timeoutMs, stop.signal),
+          ping
+        );
+        if (closed || stop.signal.aborted || result?.aborted) {
+          releasePending(result);
+          return;
+        }
+        if (!result.ok) {
+          closed = true;
+          writeSseError(controller, encoder, publicGeminiError(result.status, result.message), clientStatus(result.status));
+          return;
+        }
+        const pumped = await withPings(
+          pumpGeminiStream(result, controller, encoder),
+          ping
+        );
+        if (closed || stop.signal.aborted || pumped?.sentError) {
+          closed = true;
+          return;
+        }
+        closed = true;
+        try { controller.close(); } catch { /* 已關閉 */ }
+      } catch (err) {
+        if (closed || stop.signal.aborted) return;
+        closed = true;
+        if (err instanceof GeminiError) {
+          writeSseError(controller, encoder, err.message, err.status || 502);
+          return;
+        }
+        const timedOut = err?.name === 'AbortError' || err?.name === 'TimeoutError';
+        writeSseError(controller, encoder, publicGeminiError(503, timedOut ? 'timeout' : 'network'), 503);
+      } finally {
+        if (!stop.signal.aborted) stop.abort();
+      }
+    },
+    cancel() {
+      stop.abort();
+    }
+  });
+}
+
+async function withPings(work, ping) {
+  const tracked = Promise.resolve(work).then(
+    (value) => ({ type: 'value', value }),
+    (error) => ({ type: 'error', error })
+  );
+  let timer;
+  const waitForPing = () => new Promise((resolve) => {
+    timer = setTimeout(() => resolve('ping'), SUMMARY_HEARTBEAT_MS);
+  });
+  try {
+    while (true) {
+      const result = await Promise.race([tracked, waitForPing()]);
+      clearTimeout(timer);
+      if (result === 'ping') {
+        ping();
+        continue;
+      }
+      if (result.type === 'error') throw result.error;
+      return result.value;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function openSummaryStream(env, factory, timeoutMs, parentSignal) {
+  let result = await postGeminiStream(env, factory({ thinking: !omitThinking, schema: !omitSchema }), timeoutMs, parentSignal);
+  if (result.aborted) return result;
+  if (!result.ok && result.status === 400 && !omitThinking && /thinking/i.test(result.message)) {
+    omitThinking = true;
+    result = await postGeminiStream(env, factory({ thinking: false, schema: !omitSchema }), timeoutMs, parentSignal);
+  }
+  if (result.aborted) return result;
+  if (!result.ok && result.status === 400 && !omitSchema && /schema|mime/i.test(result.message)) {
+    omitSchema = true;
+    result = await postGeminiStream(env, factory({ thinking: !omitThinking, schema: false }), timeoutMs, parentSignal);
+  }
+  return result;
+}
+
+async function postGeminiStream(env, body, timeoutMs = GEMINI_TIMEOUT_MS, parentSignal) {
+  if (typeof env?.GEMINI_API_KEY !== 'string' || !env.GEMINI_API_KEY) {
+    throw new GeminiError('語音服務尚未設定，請檢查 Worker 的 GEMINI_API_KEY。', 500);
+  }
+  let result = await requestModelStream(env, body, GEMINI_MODEL, timeoutMs, parentSignal);
+  for (let i = 0; i < GEMINI_RETRY_DELAYS_MS.length && !result.ok && isRetryableStatus(result.status) && !result.timedOut && !result.aborted; i += 1) {
+    await sleep(GEMINI_RETRY_DELAYS_MS[i], parentSignal);
+    result = await requestModelStream(env, body, GEMINI_MODEL, timeoutMs, parentSignal);
+  }
+  const fallback = GEMINI_FALLBACK_MODEL.trim();
+  if (fallback && !result.aborted && shouldTryFallbackModel(result)) {
+    const primary = result;
+    result = await requestModelStream(env, adaptBodyForFallbackModel(body), fallback, timeoutMs, parentSignal);
+    if (!result.ok && isFallbackModelMissing(result)) {
+      console.error('fallback model not found', fallback);
+      return primary;
+    }
+  }
+  return result;
+}
+
+async function requestModelStream(env, body, model, timeoutMs = GEMINI_TIMEOUT_MS, parentSignal) {
+  const endpointName = 'streamGenerateContent';
+  if (parentSignal?.aborted) return { ok: false, status: 503, message: 'network', timedOut: false, aborted: true };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const onParent = () => controller.abort();
+  parentSignal?.addEventListener('abort', onParent, { once: true });
+  const finish = () => {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', onParent);
+  };
+  try {
+    console.log('gemini', 'call', endpointName, model);
+    const response = await fetch(geminiStreamEndpoint(model), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': env.GEMINI_API_KEY
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      finish();
+      const raw = await response.text();
+      let data = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        data = {};
+      }
+      const message = redactSecrets(String(data?.error?.message || raw || ''), env.GEMINI_API_KEY).slice(0, 500);
+      logGeminiHttpError(response.status, endpointName, model, data, raw, env.GEMINI_API_KEY, message);
+      return { ok: false, status: response.status, message, timedOut: false, aborted: Boolean(parentSignal?.aborted), model };
+    }
+    if (!response.body) {
+      finish();
+      return { ok: false, status: 502, message: '', timedOut: false, aborted: false, model };
+    }
+    console.log('gemini', 'using', endpointName, model);
+    return { ok: true, status: response.status, response, controller, timer, parentSignal, onParent, model };
+  } catch (err) {
+    finish();
+    if (parentSignal?.aborted) return { ok: false, status: 503, message: 'network', timedOut: false, aborted: true, model };
+    const timedOut = controller.signal.aborted || err?.name === 'AbortError' || err?.name === 'TimeoutError';
+    console.error('gemini', timedOut ? 'timeout' : 'network', endpointName, model);
+    return { ok: false, status: 503, message: timedOut ? 'timeout' : 'network', timedOut, aborted: false, model };
+  }
+}
+
+async function pumpGeminiStream(pending, controller, encoder) {
+  const { response, timer, parentSignal, onParent, model } = pending;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let sentText = false;
+  let reason = '';
+  let rawText = '';
+  const remember = (update) => {
+    if (update?.reason) reason = update.reason;
+    if (update?.text) {
+      sentText = true;
+      rawText += update.text;
+    }
+  };
+  try {
+    while (true) {
+      const next = await reader.read();
+      if (next.value) buffer += decoder.decode(next.value, { stream: true });
+      if (next.done) break;
+      const drained = drainSse(buffer);
+      buffer = drained.buffer;
+      if (!forwardGeminiEvents(drained.events, controller, encoder, remember)) return { sentError: true };
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      const drained = drainSse(`${buffer}\n\n`);
+      if (!forwardGeminiEvents(drained.events, controller, encoder, remember)) return { sentError: true };
+    }
+    logFallbackRawText(model, rawText);
+    if (reason === 'SAFETY' || reason === 'BLOCKLIST') {
+      writeSseError(controller, encoder, '內容被安全機制攔截，請稍後再試。', 502);
+      return { sentError: true };
+    }
+    if (!sentText && reason && reason !== 'STOP') {
+      writeSseError(controller, encoder, '語音服務沒有回傳內容，請再試一次。', 502);
+      return { sentError: true };
+    }
+    return { sentError: false };
+  } catch (err) {
+    if (parentSignal?.aborted) throw err;
+    const timedOut = err?.name === 'AbortError' || err?.name === 'TimeoutError';
+    writeSseError(controller, encoder, publicGeminiError(503, timedOut ? 'timeout' : 'network'), 503);
+    return { sentError: true };
+  } finally {
+    clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', onParent);
+    try { await reader.cancel(); } catch { /* 連線已結束 */ }
+  }
+}
+
+function logFallbackRawText(model, rawText) {
+  const fallback = GEMINI_FALLBACK_MODEL.trim();
+  if (!fallback || model !== fallback) return;
+  const preview = redactSecrets(String(rawText || '')).slice(0, 500);
+  console.log('gemini', 'fallback raw', model, preview);
+}
+
+function releasePending(result) {
+  if (!result || result.ok !== true) return;
+  clearTimeout(result.timer);
+  result.parentSignal?.removeEventListener('abort', result.onParent);
+  try { result.controller?.abort(); } catch { /* 已停止 */ }
+  const cancel = result.response?.body?.cancel;
+  if (typeof cancel === 'function') cancel.call(result.response.body).catch(() => {});
+}
+
+function forwardGeminiEvents(events, streamController, encoder, onUpdate) {
+  for (let i = 0; i < events.length; i += 1) {
+    const chunk = interpretGeminiSse(events[i]);
+    if (!chunk) continue;
+    if (chunk.error) {
+      writeSseError(streamController, encoder, chunk.error, chunk.status || 502);
+      return false;
+    }
+    if (chunk.reason) onUpdate({ reason: chunk.reason });
+    if (chunk.text) {
+      onUpdate({ text: chunk.text });
+      streamController.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk.text })}\n\n`));
+    }
+  }
+  return true;
+}
+
+function interpretGeminiSse(raw) {
+  const dataLines = [];
+  String(raw || '').split(/\r?\n/).forEach((line) => {
+    if (!line || line.startsWith(':')) return;
+    if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+  });
+  if (!dataLines.length) return null;
+  const data = dataLines.join('\n');
+  if (data === '[DONE]') return null;
+  let json;
+  try {
+    json = JSON.parse(data);
+  } catch {
+    return { error: '整理失敗，模型沒有回傳有效的記錄。', status: 502 };
+  }
+  if (json?.error) {
+    const status = Number(json.error.code) || 502;
+    return {
+      error: publicGeminiError(status, String(json.error.message || '')),
+      status: clientStatus(status)
+    };
+  }
+  const block = json?.promptFeedback?.blockReason || '';
+  if (block === 'SAFETY' || block === 'BLOCKLIST') {
+    return { error: '內容被安全機制攔截，請稍後再試。', status: 502, reason: block };
+  }
+  const finish = String(json?.candidates?.[0]?.finishReason || '');
+  if (finish === 'SAFETY' || finish === 'BLOCKLIST') {
+    return { error: '內容被安全機制攔截，請稍後再試。', status: 502, reason: finish };
+  }
+  const parts = json?.candidates?.[0]?.content?.parts || [];
+  const text = parts.filter((part) => part && part.text && !part.thought).map((part) => part.text).join('');
+  return { text, reason: finish };
+}
+
+function drainSse(buffer) {
+  const events = [];
+  let rest = buffer;
+  while (rest) {
+    const match = /\r?\n\r?\n/.exec(rest);
+    if (!match) break;
+    events.push(rest.slice(0, match.index));
+    rest = rest.slice(match.index + match[0].length);
+  }
+  return { events, buffer: rest };
+}
+
+function writeSseError(controller, encoder, message, status) {
+  try {
+    controller.enqueue(encoder.encode(`event: error\ndata: ${JSON.stringify({ error: message, status })}\n\n`));
+    controller.close();
+  } catch {
+    try { controller.error(new Error(message)); } catch { /* 串流已關閉 */ }
+  }
+}
+
+function isRetryableStatus(status) {
+  return status === 500 || status === 502 || status === 503 || status === 504 || status === 524;
+}
+
+function isDailyQuotaExhausted(status, message) {
+  if (status !== 429) return false;
+  const quotaText = String(message || '').toLowerCase().replace(/[_-]+/g, ' ');
+  return quotaText.includes('per day') || quotaText.includes('free tier');
+}
+
+function shouldTryFallbackModel(result) {
+  if (!result || result.ok || result.timedOut) return false;
+  if (isRetryableStatus(result.status)) return true;
+  return isDailyQuotaExhausted(result.status, result.message);
+}
+
+function isFallbackModelMissing(result) {
+  if (result?.status === 404) return true;
+  const message = String(result?.message || '').toLowerCase();
+  return message.includes('not found') || message.includes('is not found') || message.includes('does not exist');
+}
+
+function sleep(ms, signal) {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      const error = new Error('aborted');
+      error.name = 'AbortError';
+      reject(error);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function extractText(data) {
@@ -304,48 +703,6 @@ function extractText(data) {
     throw new GeminiError('語音服務沒有回傳內容，請再試一次。', 502);
   }
   return text;
-}
-
-function parseModelJson(text) {
-  let raw = String(text || '').trim();
-  if (raw.startsWith('```')) raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-  try {
-    return JSON.parse(raw);
-  } catch {
-    const start = raw.indexOf('{');
-    const end = raw.lastIndexOf('}');
-    if (start >= 0 && end > start) return JSON.parse(raw.slice(start, end + 1));
-    throw new GeminiError('整理失敗，模型沒有回傳有效的記錄。', 502);
-  }
-}
-
-function normalizeNotes(raw) {
-  const source = raw && typeof raw === 'object' ? raw : {};
-  const generic = new Set(['我們', '大家', '與會者', '全體', '未知']);
-  return {
-    title: text(source.title) || '未命名會議',
-    datetime: text(source.datetime),
-    attendees: stringList(source.attendees).filter((name) => !generic.has(name)),
-    summary: text(source.summary),
-    discussions: stringList(source.discussions),
-    decisions: stringList(source.decisions),
-    actions: actionList(source.actions)
-  };
-}
-
-function actionList(value) {
-  if (!Array.isArray(value)) return [];
-  return value.map((item) => ({
-    task: text(item?.task ?? item?.['事項']),
-    owner: text(item?.owner ?? item?.['負責人']),
-    due: text(item?.due ?? item?.deadline ?? item?.['期限'])
-  })).filter((item) => item.task || item.owner || item.due);
-}
-
-function stringList(value) {
-  if (Array.isArray(value)) return value.map(text).filter(Boolean);
-  if (typeof value === 'string') return value.split(/[、,，]/).map((item) => item.trim()).filter(Boolean);
-  return [];
 }
 
 function text(value) {
@@ -365,7 +722,8 @@ function clipText(value, max) {
 
 function clientStatus(status) {
   if (status === 400) return 400;
-  if (status === 429 || status === 500 || status === 503) return status;
+  if (status === 429) return 429;
+  if (isRetryableStatus(status)) return 503;
   return 502;
 }
 
@@ -380,18 +738,16 @@ function redactSecrets(message, key) {
 function publicGeminiError(status, message) {
   const full = redactSecrets(message).replace(/\s+/g, ' ').trim();
   const lower = full.toLowerCase();
-  const quotaText = lower.replace(/[_-]+/g, ' ');
   if (status === 401 || status === 403 || lower.includes('api key')) {
     return '語音服務金鑰無效，請檢查 Worker 的 GEMINI_API_KEY。';
   }
-  if (status === 429 && (quotaText.includes('per day') || quotaText.includes('free tier'))) {
+  if (isDailyQuotaExhausted(status, full)) {
     return '今天的免費額度已用完，明天重置後可按重試';
   }
-  if (status === 503) return '服務忙碌，稍後自動重試';
+  if (isRetryableStatus(status)) return '服務忙碌，稍後自動重試';
   if (status === 429 || lower.includes('quota') || lower.includes('resource exhausted')) {
     return '語音服務忙碌或額度不足，請稍後再試。';
   }
-  if (status === 500) return '語音服務暫時無法使用，請稍後再試。';
   const safe = full.slice(0, 160);
   if (safe) return `語音服務錯誤（${status}）：${safe}`;
   return '語音服務暫時無法使用，請稍後再試。';

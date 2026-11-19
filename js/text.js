@@ -53,7 +53,8 @@ export function transcriptHint(languages) {
   return '';
 }
 
-export function noteBlocks(note) {
+export function noteBlocks(note, options = {}) {
+  const includeTranscript = options.includeTranscript !== false;
   const languages = Array.isArray(note.languages) && note.languages.length ? note.languages : ['auto'];
   const attendees = cleanList(note.attendees);
   const discussions = cleanList(note.discussions);
@@ -66,17 +67,17 @@ export function noteBlocks(note) {
     { type: 'p', text: `會議語言：${languages.map(languageLabel).join('、')}` },
     { type: 'p', text: `與會者：${attendees.join('、') || '（未能辨識）'}` }
   ];
-  if (shouldKeepOriginalNote(languages)) {
+  if (includeTranscript && shouldKeepOriginalNote(languages)) {
     blocks.push({ type: 'p', text: '本記錄以繁體中文撰寫，文末保留逐字稿。' });
   }
   blocks.push({ type: 'h2', text: '摘要' });
-  pushLines(blocks, note.summary);
+  pushLines(blocks, note.summary, note);
   blocks.push({ type: 'h2', text: '討論重點' });
-  pushItems(blocks, discussions);
+  pushItems(blocks, discussions, note);
   blocks.push({ type: 'h2', text: '決議事項' });
-  pushItems(blocks, decisions);
+  pushItems(blocks, decisions, note);
   blocks.push({ type: 'h2', text: '待辦事項' });
-  if (!actions.length) blocks.push({ type: 'p', text: '（無）' });
+  if (!actions.length) blocks.push({ type: 'p', text: emptySectionText(note) });
   actions.forEach((item, index) => {
     const extra = [];
     if (clean(item.owner)) extra.push(`負責人：${clean(item.owner)}`);
@@ -84,6 +85,7 @@ export function noteBlocks(note) {
     const suffix = extra.length ? `（${extra.join('，')}）` : '';
     blocks.push({ type: 'p', text: `${index + 1}. ${clean(item.task) || '（未填事項）'}${suffix}` });
   });
+  if (!includeTranscript) return blocks;
   blocks.push({ type: 'h2', text: '逐字稿' });
   const transcript = clean(note.transcript);
   if (!transcript) blocks.push({ type: 'p', text: '（無）' });
@@ -133,10 +135,17 @@ function cleanList(value) {
   return value.map((item) => clean(item)).filter(Boolean);
 }
 
-function pushLines(blocks, value) {
+function emptySectionText(note) {
+  if (!clean(note?.transcript)) return '（無）';
+  const error = clean(note?.summaryError);
+  if (error) return error;
+  return '（無）';
+}
+
+function pushLines(blocks, value, note) {
   const text = clean(value);
   if (!text) {
-    blocks.push({ type: 'p', text: '（無）' });
+    blocks.push({ type: 'p', text: emptySectionText(note) });
     return;
   }
   text.split('\n').forEach((line) => {
@@ -144,9 +153,9 @@ function pushLines(blocks, value) {
   });
 }
 
-function pushItems(blocks, items) {
+function pushItems(blocks, items, note) {
   if (!items.length) {
-    blocks.push({ type: 'p', text: '（無）' });
+    blocks.push({ type: 'p', text: emptySectionText(note) });
     return;
   }
   items.forEach((item, index) => blocks.push({ type: 'p', text: `${index + 1}. ${item}` }));

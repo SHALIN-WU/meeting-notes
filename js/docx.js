@@ -5,7 +5,7 @@ export { docxFileName };
 const LOGO_URL = new URL('../images/northgo-logo.png', import.meta.url);
 const LOGO_CX = 4 * 360000;
 
-export async function createDocx(note, zipLib) {
+export async function createDocx(note, zipLib, options = {}) {
   const JSZip = zipLib || globalThis.JSZip;
   if (!JSZip) throw new Error('找不到 Word 函式庫。');
   const logo = await loadLogo();
@@ -15,7 +15,7 @@ export async function createDocx(note, zipLib) {
   zip.folder('_rels').file('.rels', rootRels());
   zip.folder('docProps').file('core.xml', coreXml(title));
   const word = zip.folder('word');
-  word.file('document.xml', documentXml(noteBlocks(note), logo));
+  word.file('document.xml', documentXml(noteBlocks(note, options), logo));
   word.file('styles.xml', stylesXml());
   word.file('settings.xml', settingsXml());
   word.folder('_rels').file('document.xml.rels', documentRels(logo));

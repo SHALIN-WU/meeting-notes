@@ -9,9 +9,14 @@ import { formatClock, formatLocal, joinTranscript, notesToText, shiftTranscript,
 import { acquireWakeLock, releaseWakeLock } from './wakelock.js';
 
 const BUSY_RETRY_TEXT = '服務忙碌，稍後自動重試';
-const QUOTA_TEXT = '今天的免費額度已用完，明天重置後可按重試';
+const LOCATION_RETRY_TEXT = '服務暫時無法使用，稍後自動重試';
+const QUOTA_TEXT = '今天的免費額度已用完，約台灣時間下午 4 點後重置，可按重試';
+const QUOTA_FINISH_TEXT = '尚有段落未轉錄，額度重置後按重試再產生會議記錄';
 const CHUNK_RETRY_MS = 30000;
+const SUMMARIZE_TIMEOUT_MS = 210000;
+const SUMMARY_WAIT_TEXT = '整理中，長會議可能需要 1–3 分鐘';
 const CHUNK_RETRY_LIMIT = 5;
+const INCLUDE_TRANSCRIPT_KEY = 'meeting-ai-include-transcript-docx';
 
 const recorder = createRecorder();
 let phase = 'idle';
@@ -49,6 +54,7 @@ void boot().catch(() => {
 async function boot() {
   delete document.documentElement.dataset.boot;
   bindStaticEvents();
+  restoreIncludeTranscriptPreference();
   renderChips();
   applySegmentCopy();
   bootAuth();
@@ -72,6 +78,9 @@ function bindStaticEvents() {
   $('historyBtn').addEventListener('click', () => { void showHistory(); });
   $('historyBack').addEventListener('click', () => { showView('viewHome'); renderHome(); });
   $('viewNotes').addEventListener('click', onNotesClick);
+  $('includeTranscript').addEventListener('change', () => {
+    saveIncludeTranscriptPreference($('includeTranscript').checked);
+  });
   $('viewNotes').addEventListener('input', (event) => {
     if (event.target instanceof HTMLTextAreaElement && event.target.classList.contains('grow-box')) {
       fitGrowBox(event.target);
@@ -318,7 +327,9 @@ function createSession() {
     datetime: formatLocal(started),
     durationMs: 0,
     chunks: [],
-    authFailed: false
+    authFailed: false,
+    quotaExhausted: false,
+    summaryStarted: false
   };
 }
 
@@ -341,11 +352,19 @@ function onSlice(slice) {
     controller: new AbortController(),
     inflight: false,
     retryable: false,
+    held: false,
+    manualRetry: false,
     autoRetries: 0,
     retryTimer: 0
   };
   session.chunks.push(chunk);
-  enqueue(chunk);
+  if (session.quotaExhausted) {
+    chunk.status = 'error';
+    chunk.held = true;
+    chunk.error = QUOTA_TEXT;
+  } else {
+    enqueue(chunk);
+  }
   renderTranscript();
   updateChunkStatus();
 }
@@ -364,7 +383,10 @@ function trackUpload(promise) {
   promise.finally(() => {
     runningUploads = Math.max(0, runningUploads - 1);
     updateChunkStatus();
-    if (runningUploads === 0) idleWaiters.splice(0).forEach((resolve) => resolve());
+    if (runningUploads === 0) {
+      idleWaiters.splice(0).forEach((resolve) => resolve());
+      void maybeAutoSummarize();
+    }
   });
 }
 
@@ -380,22 +402,49 @@ function clearChunkRetry(chunk) {
 }
 
 function scheduleChunkRetry(chunk) {
-  if (phase === 'finishing') return;
+  if (phase === 'finishing' || session?.quotaExhausted) return;
   if (!chunk?.retryable || !chunk.blob || chunk.controller?.signal.aborted) return;
   if ((chunk.autoRetries || 0) >= CHUNK_RETRY_LIMIT) return;
   clearChunkRetry(chunk);
   chunk.retryTimer = setTimeout(() => {
     chunk.retryTimer = 0;
     if (!session?.chunks.includes(chunk)) return;
-    if (phase === 'finishing' || chunk.status !== 'error' || chunk.inflight || !chunk.blob) return;
+    if (session.quotaExhausted || phase === 'finishing' || chunk.status !== 'error' || chunk.inflight || !chunk.blob) return;
     if (chunk.controller?.signal.aborted) return;
     chunk.autoRetries = (chunk.autoRetries || 0) + 1;
     enqueue(chunk);
   }, CHUNK_RETRY_MS);
 }
 
-async function retryFailedChunksOnce() {
+function noteDailyQuota(chunk) {
+  chunk.status = 'error';
+  chunk.retryable = false;
+  chunk.held = false;
+  chunk.error = QUOTA_TEXT;
+  clearChunkRetry(chunk);
   if (!session) return;
+  session.quotaExhausted = true;
+  session.chunks.forEach((item) => clearChunkRetry(item));
+}
+
+function resumePausedAutoRetries() {
+  if (!session || session.quotaExhausted) return;
+  session.chunks.forEach((chunk) => {
+    if (chunk.status === 'error' && chunk.retryable && chunk.blob && !chunk.inflight) scheduleChunkRetry(chunk);
+  });
+}
+
+function hasUntranscribedQuotaChunks() {
+  if (!session) return false;
+  return session.chunks.some((chunk) => {
+    if (!chunk.blob || chunk.status !== 'error') return false;
+    if (chunk.held || isQuotaMessage(chunk.error)) return true;
+    return Boolean(session.quotaExhausted && chunk.retryable);
+  });
+}
+
+async function retryFailedChunksOnce() {
+  if (!session || session.quotaExhausted) return;
   if (session.authFailed && !getToken()) {
     session.chunks.forEach(clearChunkRetry);
     return;
@@ -406,6 +455,7 @@ async function retryFailedChunksOnce() {
     && chunk.blob
     && !chunk.inflight
     && !chunk.controller?.signal.aborted
+    && !chunk.held
     && !String(chunk.error || '').includes('重新登入')
     && !isQuotaMessage(chunk.error)
   ));
@@ -428,9 +478,14 @@ function isDailyQuotaError(err) {
   return true;
 }
 
+function isLocationError(err) {
+  return String(err?.message || '').toLowerCase().includes('user location is not supported');
+}
+
 function isAutoRetryError(err) {
   const message = String(err?.message || '');
   if (isDailyQuotaError(err)) return false;
+  if (isLocationError(err)) return true;
   if (message.includes('金鑰無效') || message.includes('請重新登入') || message.includes('尚未設定') || message.includes('尚未完成設定')) return false;
   if (err instanceof ApiError && (err.code === 401 || err.code === 400 || err.code === 403 || err.code === 413 || err.code === 415 || err.code === 429 || err.code === 500)) {
     return false;
@@ -444,12 +499,18 @@ function isAutoRetryError(err) {
 
 function visibleError(err, fallback) {
   if (isDailyQuotaError(err)) return QUOTA_TEXT;
+  if (isLocationError(err)) return LOCATION_RETRY_TEXT;
   if (isAutoRetryError(err)) return BUSY_RETRY_TEXT;
   return err?.message || fallback;
 }
 
 async function uploadChunk(chunk, attempt = 1) {
   if (!session || !chunk.blob) return;
+  const manual = attempt === 1 && chunk.manualRetry;
+  if (attempt === 1) {
+    chunk.manualRetry = false;
+    chunk.held = false;
+  }
   chunk.status = 'pending';
   chunk.error = '';
   renderTranscript();
@@ -464,15 +525,21 @@ async function uploadChunk(chunk, attempt = 1) {
     chunk.text = shiftTranscript(result.text || '', chunk.offsetSec);
     chunk.status = chunk.text ? 'done' : 'done';
     chunk.retryable = false;
+    chunk.held = false;
     chunk.error = '';
     clearChunkRetry(chunk);
     chunk.blob = undefined;
+    if (manual && session.quotaExhausted) {
+      session.quotaExhausted = false;
+      resumePausedAutoRetries();
+    }
     $('srStatus').textContent = `第 ${chunk.index + 1} 段逐字稿已更新`;
   } catch (err) {
     if (!session?.chunks.includes(chunk)) return;
     if (err instanceof ApiError && err.code === 401) {
       chunk.status = 'error';
       chunk.retryable = false;
+      chunk.held = false;
       chunk.error = '請重新登入後再轉寫這一段';
       clearChunkRetry(chunk);
       session.authFailed = true;
@@ -481,20 +548,18 @@ async function uploadChunk(chunk, attempt = 1) {
       return;
     }
     if (isDailyQuotaError(err)) {
-      chunk.status = 'error';
-      chunk.retryable = false;
-      chunk.error = QUOTA_TEXT;
-      clearChunkRetry(chunk);
-    } else if (attempt < 2 && !chunk.controller.signal.aborted) {
+      noteDailyQuota(chunk);
+    } else if (attempt < 2 && !session?.quotaExhausted && !chunk.controller.signal.aborted) {
       await uploadChunk(chunk, attempt + 1);
       return;
     } else {
       chunk.status = 'error';
       chunk.retryable = false;
+      chunk.held = false;
       chunk.error = err.message || '轉寫失敗';
       if (!chunk.controller.signal.aborted && isAutoRetryError(err)) {
         chunk.retryable = true;
-        chunk.error = BUSY_RETRY_TEXT;
+        chunk.error = isLocationError(err) ? LOCATION_RETRY_TEXT : BUSY_RETRY_TEXT;
         scheduleChunkRetry(chunk);
       }
     }
@@ -518,12 +583,13 @@ function renderTranscript() {
     }
     if (chunk.status === 'error') {
       const row = el('div', { class: 'chunk-error' });
-      const detail = chunk.retryable ? BUSY_RETRY_TEXT : (chunk.error || '轉寫失敗');
+      const detail = chunkErrorLabel(chunk);
       row.append(el('p', { text: `${formatClock(chunk.offsetSec)} ${detail}` }));
       if (chunk.blob) {
         const button = el('button', { type: 'button', text: '重試' });
         button.addEventListener('click', () => {
           chunk.autoRetries = 0;
+          chunk.manualRetry = true;
           enqueue(chunk);
         });
         row.append(button);
@@ -545,11 +611,22 @@ function transcriptLine(line) {
   return row;
 }
 
+function chunkErrorLabel(chunk) {
+  if (session?.quotaExhausted && chunk.retryable) return QUOTA_TEXT;
+  if (chunk.error === LOCATION_RETRY_TEXT) return LOCATION_RETRY_TEXT;
+  if (chunk.retryable) return BUSY_RETRY_TEXT;
+  return chunk.error || '轉寫失敗';
+}
+
 function updateChunkStatus() {
   if (!$('chunkStatus')) return;
   const chunks = session?.chunks || [];
   const pending = chunks.filter((chunk) => chunk.status === 'pending').length;
-  if (phase === 'finishing' && runningUploads === 0) $('chunkStatus').textContent = '正在整理會議記錄…';
+  if (session?.quotaExhausted) {
+    $('chunkStatus').textContent = QUOTA_TEXT;
+    return;
+  }
+  if (phase === 'finishing' && runningUploads === 0) $('chunkStatus').textContent = SUMMARY_WAIT_TEXT;
   else if (pending > 0) $('chunkStatus').textContent = pending > 4 ? '轉寫速度較慢，請保持這個畫面開啟。' : `正在轉寫 ${pending} 段`;
   else if (chunks.some((chunk) => chunk.text)) $('chunkStatus').textContent = '逐字稿已更新';
   else if (phase === 'recording') $('chunkStatus').textContent = '正在聽你說話';
@@ -572,6 +649,13 @@ async function finishRecording() {
     if (session.authFailed && !getToken()) {
       phase = 'review';
       renderHome();
+      return;
+    }
+    if (session.quotaExhausted || hasUntranscribedQuotaChunks()) {
+      phase = 'review';
+      renderHome();
+      showHomeAlert(QUOTA_FINISH_TEXT);
+      if (!session.quotaExhausted) resumePausedAutoRetries();
       return;
     }
     const failed = session.chunks.filter((chunk) => chunk.status === 'error' && chunk.blob);
@@ -597,6 +681,7 @@ async function finishRecording() {
       showHomeAlert('沒有辨識到說話內容。');
       return;
     }
+    session.summaryStarted = true;
     await summarizeAndOpen(transcript);
   } catch (err) {
     phase = 'review';
@@ -605,7 +690,30 @@ async function finishRecording() {
   } finally {
     busyFinish = false;
     renderPhase();
+    void maybeAutoSummarize();
   }
+}
+
+function maybeAutoSummarize() {
+  if (busyFinish || phase !== 'review' || !session || session.summaryStarted) return;
+  if (runningUploads > 0) return;
+  if (session.authFailed && !getToken()) return;
+  if (!session.chunks.length || session.chunks.some((chunk) => chunk.status !== 'done')) return;
+  const transcript = joinTranscript(session.chunks);
+  if (!transcript.trim()) return;
+  session.summaryStarted = true;
+  busyFinish = true;
+  phase = 'finishing';
+  renderHome();
+  void summarizeAndOpen(transcript).catch((err) => {
+    if (session) session.summaryStarted = false;
+    phase = 'review';
+    renderHome();
+    showHomeAlert(visibleError(err, '整理失敗'));
+  }).finally(() => {
+    busyFinish = false;
+    renderPhase();
+  });
 }
 
 async function summarizeAndOpen(transcript) {
@@ -623,7 +731,8 @@ async function summarizeAndOpen(transcript) {
     discussions: [],
     decisions: [],
     actions: [],
-    transcript
+    transcript,
+    summaryError: ''
   };
   try {
     await saveMeeting(note);
@@ -636,18 +745,20 @@ async function summarizeAndOpen(transcript) {
       languages: note.languages,
       startedAt: note.datetime,
       durationText: formatClock(note.durationMs / 1000)
-    }, { timeoutMs: 120000 });
+    }, { timeoutMs: SUMMARIZE_TIMEOUT_MS });
+    note.summaryError = '';
     applySummary(note, ai);
     try { await saveMeeting(note); } catch { /* 已提示過 */ }
     await showFinishedNote(note, '');
   } catch (err) {
-    if (err instanceof ApiError && err.code === 401) {
-      if (session) session.authFailed = true;
-      await showFinishedNote(note, '已保留逐字稿。登入後可以按「重新整理」。');
-      await handle401();
-      return;
-    }
-    await showFinishedNote(note, visibleError(err, '整理失敗，逐字稿已保留。'));
+    const message = err instanceof ApiError && err.code === 401
+      ? '已保留逐字稿。登入後可以按「重新整理」。'
+      : visibleError(err, '整理失敗，逐字稿已保留。');
+    note.summaryError = message;
+    if (err instanceof ApiError && err.code === 401 && session) session.authFailed = true;
+    try { await saveMeeting(note); } catch { /* 已提示過 */ }
+    await showFinishedNote(note, message);
+    if (err instanceof ApiError && err.code === 401) await handle401();
   }
 }
 
@@ -758,7 +869,7 @@ function openNote(note, from) {
   returnTo = from;
   clearTimeout(saveTimer);
   renderEditor();
-  setNoteAlert('');
+  setNoteAlert(note.summaryError || '');
   setSaveState('');
   showView('viewNotes');
 }
@@ -805,7 +916,7 @@ function listBlock(title, key, items, placeholder, grow) {
       el('h3', { text: title }),
       el('button', { type: 'button', class: 'ghost', text: '新增', 'data-action': 'add', 'data-key': key })
     ),
-    ...(rows.length ? rows : [el('p', { class: 'fine', text: '尚未新增' })])
+    ...(rows.length ? rows : [el('p', { class: 'fine', text: emptyBlockText(key) })])
   );
 }
 
@@ -821,8 +932,16 @@ function actionBlock(actions) {
       el('h3', { text: '待辦事項' }),
       el('button', { type: 'button', class: 'ghost', text: '新增', 'data-action': 'add', 'data-key': 'actions' })
     ),
-    ...(rows.length ? rows : [el('p', { class: 'fine', text: '尚未新增' })])
+    ...(rows.length ? rows : [el('p', { class: 'fine', text: emptyBlockText('actions') })])
   );
+}
+
+function emptyBlockText(key) {
+  if (key === 'discussions' || key === 'decisions' || key === 'actions') {
+    const error = String(currentNote?.summaryError || '').trim();
+    if (error && String(currentNote?.transcript || '').trim()) return error;
+  }
+  return '尚未新增';
 }
 
 function labeled(title, control) {
@@ -869,6 +988,7 @@ function onNotesClick(event) {
   if (action === 'copy') { void onCopy(); return; }
   if (action === 'save') { void flushSave().then(() => toast('已儲存')); return; }
   if (action === 'regen') { void regenerate(); return; }
+  if (action === 'rebuild') { void rebuildNotes(); return; }
   if (action === 'delete') { void deleteCurrent(); return; }
   if (action === 'add') addRow(button.dataset.key);
   if (action === 'remove') removeRow(button.dataset.key, Number(button.dataset.index));
@@ -967,12 +1087,14 @@ async function onCopy() {
 
 async function onDownload() {
   currentNote = readForm();
+  const includeTranscript = $('includeTranscript').checked;
+  saveIncludeTranscriptPreference(includeTranscript);
   const saving = saveMeeting(currentNote).then((saved) => {
     currentNote = saved;
     setSaveState('已儲存');
   }).catch(() => setSaveState('尚未寫入歷史記錄'));
   try {
-    const blob = await createDocx(currentNote);
+    const blob = await createDocx(currentNote, undefined, { includeTranscript });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -988,13 +1110,44 @@ async function onDownload() {
   await saving;
 }
 
+function restoreIncludeTranscriptPreference() {
+  const box = $('includeTranscript');
+  if (!box) return;
+  try {
+    const saved = localStorage.getItem(INCLUDE_TRANSCRIPT_KEY);
+    if (saved === null) {
+      box.checked = true;
+      return;
+    }
+    box.checked = saved !== '0';
+  } catch {
+    box.checked = true;
+  }
+}
+
+function saveIncludeTranscriptPreference(checked) {
+  try {
+    localStorage.setItem(INCLUDE_TRANSCRIPT_KEY, checked ? '1' : '0');
+  } catch {
+    /* 忽略本機儲存失敗 */
+  }
+}
+
 async function regenerate() {
+  await resummarize('重新整理會覆寫主題、摘要、討論、決議與待辦。逐字稿會保留。', '重新整理', '已重新整理');
+}
+
+async function rebuildNotes() {
+  await resummarize('用目前的逐字稿重新產生會議記錄？不會重新轉錄。', '重新產生', '已重新產生會議記錄');
+}
+
+async function resummarize(confirmText, okText, doneText) {
   currentNote = readForm();
   if (!currentNote.transcript.trim()) {
     setNoteAlert('沒有逐字稿可以整理。');
     return;
   }
-  const ok = await ask('重新整理會覆寫主題、摘要、討論、決議與待辦。逐字稿會保留。', '重新整理', '取消', false);
+  const ok = await ask(confirmText, okText, '取消', false);
   if (!ok) return;
   setNotesBusy(true);
   try {
@@ -1003,7 +1156,8 @@ async function regenerate() {
       languages: currentNote.languages,
       startedAt: currentNote.datetime,
       durationText: formatClock((currentNote.durationMs || 0) / 1000)
-    }, { timeoutMs: 120000 });
+    }, { timeoutMs: SUMMARIZE_TIMEOUT_MS });
+    currentNote.summaryError = '';
     applySummary(currentNote, ai);
     try {
       currentNote = await saveMeeting(currentNote);
@@ -1013,14 +1167,16 @@ async function regenerate() {
     }
     renderEditor();
     setNoteAlert('');
-    toast('已重新整理');
+    toast(doneText);
   } catch (err) {
-    if (err instanceof ApiError && err.code === 401) {
-      renderEditor();
-      await handle401();
-      return;
-    }
-    setNoteAlert(visibleError(err, '整理失敗'));
+    const message = err instanceof ApiError && err.code === 401
+      ? '已保留逐字稿。登入後可以按「重新整理」。'
+      : visibleError(err, '整理失敗');
+    currentNote.summaryError = message;
+    try { currentNote = await saveMeeting(currentNote); } catch { /* 畫面仍保留錯誤 */ }
+    renderEditor();
+    setNoteAlert(message);
+    if (err instanceof ApiError && err.code === 401) await handle401();
   } finally {
     setNotesBusy(false);
   }
@@ -1042,11 +1198,11 @@ async function deleteCurrent() {
 
 function setNotesBusy(busy) {
   noteBusy = busy;
-  ['btnDownload', 'btnCopy', 'btnSave', 'btnRegen', 'btnDelete', 'notesBack'].forEach((id) => {
+  ['btnDownload', 'btnCopy', 'btnSave', 'btnRegen', 'btnRebuild', 'btnDelete', 'notesBack', 'includeTranscript'].forEach((id) => {
     $(id).disabled = busy;
   });
-  if (busy) setSaveState('整理中…');
-  else if ($('saveState').textContent === '整理中…') setSaveState('');
+  if (busy) setSaveState(SUMMARY_WAIT_TEXT);
+  else if ($('saveState').textContent === SUMMARY_WAIT_TEXT) setSaveState('');
 }
 
 function setNoteAlert(message) {

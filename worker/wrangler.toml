@@ -16,3 +16,6 @@ compatibility_date = "2025-11-01"
 binding = "RATE_LIMIT"
 id = "55cd214750d14b5e82bd49eed4d7325e"
 preview_id = "55cd214750d14b5e82bd49eed4d7325e"
+
+[placement]
+region = "gcp:us-central1"

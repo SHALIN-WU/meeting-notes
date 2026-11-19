@@ -104,13 +104,13 @@ async function summarize(request, env) {
   if (typeof body.transcript !== 'string' || !body.transcript.trim()) {
     return respond(request, 400, { error: '沒有逐字稿可以整理' });
   }
-  const notes = await summarizeTranscript(env, {
+  const stream = summarizeTranscript(env, {
     transcript: body.transcript,
     languages: normalizeLanguages(body.languages),
     startedAt: body.startedAt,
     durationText: body.durationText
   });
-  return respond(request, 200, notes);
+  return streamRespond(request, stream);
 }
 
 async function listModels(request, env) {
@@ -172,6 +172,24 @@ function corsHeaders(request) {
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin'
   };
+}
+
+function streamRespond(request, stream) {
+  const cors = corsHeaders(request);
+  if (cors === null) {
+    return new Response(JSON.stringify({ error: '不允許的來源' }), {
+      status: 403,
+      headers: baseHeaders({})
+    });
+  }
+  return new Response(stream, {
+    status: 200,
+    headers: baseHeaders({
+      ...cors,
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-store, no-transform'
+    })
+  });
 }
 
 function respond(request, status, body, extra = {}) {

@@ -89,6 +89,7 @@ function sanitize(raw) {
     due: text(item?.due)
   })) : [];
   note.transcript = text(raw.transcript);
+  note.summaryError = text(raw.summaryError);
   return note;
 }
 
@@ -108,7 +109,8 @@ function blank() {
     discussions: [],
     decisions: [],
     actions: [],
-    transcript: ''
+    transcript: '',
+    summaryError: ''
   };
 }
 
