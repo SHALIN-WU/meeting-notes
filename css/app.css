@@ -148,19 +148,74 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, .history-open
 .lang-box {
   width: min(100%, 640px);
   margin-top: 18px;
-  padding: 16px;
-  border-radius: 22px;
+  padding: 20px 24px;
+  border-radius: 16px;
+  border: 1px solid var(--line);
+  box-shadow: 0 2px 12px rgba(15, 30, 60, 0.06);
 }
-.lang-box legend { padding: 0 6px; font-weight: 700; }
-.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.lang-box legend {
+  float: left;
+  width: 100%;
+  padding: 0;
+  margin: 0 0 12px;
+  font-weight: 600;
+  font-size: 16px;
+  line-height: 1.4;
+  color: var(--ink);
+}
+.lang-badge {
+  display: inline-block;
+  vertical-align: middle;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e8eef3;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  clear: both;
+}
 .chip {
-  min-height: var(--tap);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 40px;
+  min-height: 40px;
   border-radius: 999px;
   border: 1px solid var(--line);
-  background: transparent;
-  padding: 8px 16px;
+  background: #fff;
+  color: var(--ink);
+  padding: 0 18px;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 }
-.chip[aria-pressed="true"] { background: var(--navy); color: #fff; border-color: var(--navy); }
+.chip:hover:not(:disabled):not([aria-pressed="true"]) {
+  background: #e8f3fb;
+  border-color: #c5d8e6;
+}
+.chip[aria-pressed="true"] {
+  background: var(--navy);
+  color: #fff;
+  border-color: var(--navy);
+}
+.chip[aria-pressed="true"]::before {
+  content: "✓";
+  font-size: 13px;
+  line-height: 1;
+  font-weight: 700;
+}
+.lang-box .fine {
+  margin: 12px 0 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--muted);
+}
 
 .wide-button, .toolbar .wide, .rec-actions button, #loginSubmit, .primary {
   font-weight: 700;
@@ -427,6 +482,19 @@ body.is-recording #viewHome,
 body.is-recording #recPanel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 body.is-recording .transcript { flex: 1; max-height: none; }
 body.is-recording .hero { display: none; }
+
+@media (max-width: 479px) {
+  .lang-box {
+    width: 100%;
+    padding: 16px 18px;
+  }
+  .lang-box legend {
+    font-size: 15px;
+  }
+  .chip {
+    padding: 0 14px;
+  }
+}
 
 @media (min-width: 800px) {
   #app { padding-inline: 24px; }

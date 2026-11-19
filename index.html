@@ -9,7 +9,7 @@
   <meta name="description" content="錄音、轉寫並整理成繁體中文會議記錄。">
   <title>會議記錄</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="css/app.css">
+  <link rel="stylesheet" href="css/app.css?v=20261119a">
   <script>
     (function () {
       var local = location.hostname === '127.0.0.1';
@@ -71,7 +71,10 @@
           </button>
           <p class="hint">使用麥克風錄音。約每 10 分鐘轉成逐字稿並標上時間，第一段會在約 10 分鐘後出現。錄音檔不會保存。</p>
           <fieldset class="lang-box">
-            <legend>會議語言（可多選）</legend>
+            <legend>
+              會議語言
+              <span class="lang-badge">可多選</span>
+            </legend>
             <div id="langChips" class="chips" role="group" aria-label="會議語言"></div>
             <p class="fine">混合會議請把會用到的語言都選起來。選了台語時，會把台語轉寫成繁體中文意思。</p>
           </fieldset>
@@ -146,6 +149,6 @@
   <div id="srStatus" class="sr-only" role="status"></div>
   <noscript><p class="banner">請開啟 JavaScript 才能使用會議記錄。</p></noscript>
   <script src="libs/jszip.min.js"></script>
-  <script type="module" src="js/app.js"></script>
+  <script type="module" src="js/app.js?v=20261119a"></script>
 </body>
 </html>
